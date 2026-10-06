@@ -1,63 +1,116 @@
 # Highlight Elixir SDK
 
-This repository contains the source code for the `Highlight` Elixir SDK, which integrates with OpenTelemetry to provide exception tracking, logging, and monitoring capabilities for Elixir applications.
+The `highlight` package integrates Elixir applications with Highlight via
+OpenTelemetry: error monitoring, `Logger` output as OTLP LogRecords, and
+Phoenix/LiveView tracing, exported to `https://otel.highlight.io:4318` over
+OTLP/HTTP.
 
-## Prerequisites
+## Installation
 
-Before you start, make sure you have the following installed on your system:
-
-- **Elixir** (version 1.10 or later)
-- **Erlang/OTP** (compatible with your Elixir version)
-
-To check if Elixir and Erlang/OTP are installed, run:
-
-```sh
-elixir -v
+```elixir
+defp deps do
+  [
+    {:highlight, "~> 0.2"}
+  ]
+end
 ```
 
-You should see output similar to:
+Optional integrations are attached automatically when present:
 
-```sh
-Erlang/OTP 25 [erts-11.1.3] [source] [64-bit]
-Elixir 1.13.4 (compiled with Erlang/OTP 25)
+```elixir
+{:opentelemetry_phoenix, "~> 2.0"},
+{:opentelemetry_bandit, "~> 0.3"},   # Bandit users
+{:opentelemetry_cowboy, "~> 1.0"}    # Cowboy/Plug.Cowboy users
 ```
 
-## Setting Up the Development Environment
+## Setup
 
-After cloning the repository, you need to install the dependencies. Use the following command:
+Call `Highlight.init/1` once, early in `Application.start/2` — before your
+endpoint starts serving traffic, so the exporter and instrumentation are
+configured first:
+
+```elixir
+def start(_type, _args) do
+  Highlight.init(project_id: System.fetch_env!("HIGHLIGHT_PROJECT_ID"))
+
+  children = [
+    MyAppWeb.Endpoint
+  ]
+
+  Supervisor.start_link(children, strategy: :one_for_one)
+end
+```
+
+Or with a config struct (equivalent):
+
+```elixir
+Highlight.init(%Highlight.Config{
+  project_id: "your-project-id",
+  service_name: "my-backend",
+  service_version: "1.4.2"
+})
+```
+
+`init/1` will:
+
+- Point the OpenTelemetry exporter at `https://otel.highlight.io:4318`
+  (OTLP/HTTP + protobuf) with the `x-highlight-project` header and a
+  `highlight.project_id` resource attribute.
+- Attach an OpenTelemetry `:logger` handler so `Logger` output is shipped
+  as LogRecords on `v1/logs` (requires `opentelemetry_experimental`,
+  included as a dependency).
+- Attach `OpentelemetryPhoenix` — including LiveView spans — and
+  Bandit/Cowboy server spans when those packages are in your deps.
+
+## Recording exceptions
+
+```elixir
+try do
+  risky_operation()
+rescue
+  e -> Highlight.record_exception(e)
+end
+```
+
+`record_exception/5` accepts an exception or any thrown term and follows
+the OpenTelemetry exception semantic convention. Optional `session_id` and
+`request_id` arguments associate the error with a client session:
+
+```elixir
+Highlight.record_exception(exception, config, session_id, request_id)
+```
+
+## Phoenix error monitoring
+
+Wire `Plug.ErrorHandler` errors into Highlight from your endpoint:
+
+```elixir
+defmodule MyAppWeb.Endpoint do
+  use Phoenix.Endpoint, otp_app: :my_app
+  use Plug.ErrorHandler
+
+  @impl Plug.ErrorHandler
+  def handle_errors(conn, assigns) do
+    Highlight.ErrorHandler.handle_errors(conn, assigns)
+  end
+end
+```
+
+Session/request IDs are read from the `X-Highlight-Request` header
+(`<session_id>/<request_id>`), matching the client SDK convention.
+
+To tag request spans with the same context on every request:
+
+```elixir
+plug Highlight.Plug
+```
+
+## Development
 
 ```sh
 mix deps.get
-```
-
-This will download and install all necessary dependencies required for the project.
-
-## Compiling the Project
-
-To compile the project, run:
-
-```sh
 mix compile
-```
-
-This ensures that all the modules are compiled and ready for use.
-
-## Running Tests
-
-To ensure that everything is set up correctly and that your changes don't break any existing functionality, run the tests:
-
-```sh
 mix test
 ```
 
-This will execute the test suite and provide you with feedback on the status of the codebase.
-
-## Running the Project
-
-You can start an interactive Elixir shell with the project loaded by running:
-
-```sh
-iex -S mix
-```
-
-This is useful for testing the library interactively.
+Requires Elixir `~> 1.13` and a compatible Erlang/OTP.

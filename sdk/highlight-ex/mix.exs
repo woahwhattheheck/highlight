@@ -4,7 +4,7 @@ defmodule Highlight.MixProject do
   def project do
     [
       app: :highlight,
-      version: "0.1.0",
+      version: "0.2.0",
       description: "Highlight Elixir SDK for capturing logs, spans and metrics",
       elixir: "~> 1.13",
       package: package(),
@@ -37,9 +37,19 @@ defmodule Highlight.MixProject do
   defp deps do
     [
       {:ex_doc, ">= 0.0.0", only: :dev, runtime: false},
-      {:opentelemetry, "~> 1.3"},
-      {:opentelemetry_api, "~> 1.2"},
       {:telemetry, "~> 1.0"},
+      {:opentelemetry, "~> 1.5"},
+      {:opentelemetry_api, "~> 1.5"},
+      {:opentelemetry_exporter, "~> 1.10"},
+      # Experimental OpenTelemetry logs support (`otel_log_handler`); ships
+      # Logger output to the OTLP `v1/logs` endpoint.
+      {:opentelemetry_experimental, "~> 0.6.0"},
+      # Optional integrations; detected and attached by `Highlight.init/1`
+      # when present in the host application.
+      {:plug, "~> 1.14", optional: true},
+      {:opentelemetry_phoenix, "~> 2.0", optional: true},
+      {:opentelemetry_bandit, "~> 0.3", optional: true},
+      {:opentelemetry_cowboy, "~> 1.0", optional: true}
     ]
   end
 end

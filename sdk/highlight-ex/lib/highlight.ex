@@ -1,116 +1,249 @@
 defmodule Highlight do
   @moduledoc """
-  Documentation for Highlight.
+  Highlight SDK for Elixir: error monitoring, logging and tracing backed by
+  OpenTelemetry, exporting OTLP/HTTP to `https://otel.highlight.io:4318`.
 
-  ## Install SDK
+  ## Usage
 
-    In your `mix.exs` file:
+      Highlight.init(project_id: "<PROJECT_ID>")
 
-    ```elixir
-    defp deps do
-      [
-        ...
-        {:highlight, "~> 0.1"}
-      ]
-    end
-    ```
+      # or
+      Highlight.init(%Highlight.Config{project_id: "<PROJECT_ID>"})
+
+  `init/1` configures the OpenTelemetry exporters, attaches a `:logger`
+  handler that ships `Logger` output as LogRecords to `v1/logs`, and
+  attaches Phoenix/LiveView + web-server instrumentation when the optional
+  `:opentelemetry_phoenix`, `:opentelemetry_bandit` or
+  `:opentelemetry_cowboy` packages are present.
+
+  Exceptions are recorded following the OpenTelemetry exception reporting
+  specification:
+
+      try do
+        risky()
+      rescue
+        e -> Highlight.record_exception(e)
+      end
   """
+
   require OpenTelemetry.Tracer, as: Tracer
+  alias OpenTelemetry.Span
   require Logger
 
+  @highlight_project_header "x-highlight-project"
+  @log_handler_id :highlight_log_handler
+  @config_key {__MODULE__, :config}
+
   defmodule Config do
+    @moduledoc """
+    Configuration for the Highlight SDK.
+
+    * `:project_id` - Highlight project ID. Required for data to be routed
+      to a project; sent as the `x-highlight-project` exporter header and
+      as the `highlight.project_id` resource/record attribute.
+    * `:service_name`, `:service_version` - OTLP resource attributes.
+    * `:otlp_endpoint` - OTLP/HTTP base endpoint. Defaults to the Highlight
+      collector at `https://otel.highlight.io:4318`.
+    * `:attach_log_handler` - attach the OpenTelemetry `:logger` handler so
+      `Logger` output is exported as LogRecords on `v1/logs`. Default true.
+    * `:instrument_phoenix` - attach `OpentelemetryPhoenix` (with LiveView
+      spans) and the Bandit/Cowboy server spans when those optional
+      packages are present. Default true.
+    """
+
     @enforce_keys [:project_id]
-    defstruct [
-      :project_id,
-      :service_name,
-      :service_version
-    ]
+    defstruct project_id: nil,
+              service_name: nil,
+              service_version: nil,
+              otlp_endpoint: "https://otel.highlight.io:4318",
+              attach_log_handler: true,
+              instrument_phoenix: true
   end
 
   @doc """
-  Initialize the Highlight SDK with the given configuration.
-  This sets up Elixir for automatic log collection.
+  Initialize the Highlight SDK.
 
-  ## Examples
-
-    iex> Highlight.init()
+  Accepts a `%Highlight.Config{}`, a keyword list, or nothing (in which case
+  `config :highlight, :project_id` is read). Call once, early in
+  `Application.start/2`, before traffic is served.
   """
-  def init() do
-    :telemetry.attach(
-      "highlight-logger",
-      [:logger, :message],
-      &Highlight.handle_logger_event/4,
-      nil
+  @spec init(Config.t() | keyword()) :: :ok
+  def init(config \\ []) do
+    config = resolve_config(config)
+    :persistent_term.put(@config_key, config)
+    configure_opentelemetry(config)
+    {:ok, _} = Application.ensure_all_started(:opentelemetry)
+    if config.attach_log_handler, do: attach_log_handler()
+    maybe_instrument_phoenix(config)
+    :ok
+  end
+
+  @doc "The config stored by the most recent `init/1` call, or nil."
+  @spec current_config() :: Config.t() | nil
+  def current_config, do: :persistent_term.get(@config_key, nil)
+
+  defp resolve_config(%Config{} = config), do: config
+
+  defp resolve_config(opts) when is_list(opts) do
+    opts = Keyword.put_new(opts, :project_id, Application.get_env(:highlight, :project_id))
+    struct!(Config, opts)
+  end
+
+  defp configure_opentelemetry(%Config{} = config) do
+    Application.put_env(:opentelemetry, :span_processor, :batch)
+    Application.put_env(:opentelemetry, :traces_exporter, :otlp)
+
+    Application.put_env(:opentelemetry, :resource_detectors, [
+      :otel_resource_env_var,
+      :otel_resource_app_env
+    ])
+
+    Application.put_env(:opentelemetry_exporter, :otlp_protocol, :http_protobuf)
+    Application.put_env(:opentelemetry_exporter, :otlp_endpoint, config.otlp_endpoint)
+
+    existing_headers = Application.get_env(:opentelemetry_exporter, :otlp_headers, [])
+
+    headers =
+      existing_headers
+      |> Enum.reject(fn {k, _v} -> String.downcase(to_string(k)) == @highlight_project_header end)
+      |> Kernel.++([{@highlight_project_header, to_string(config.project_id)}])
+
+    Application.put_env(:opentelemetry_exporter, :otlp_headers, headers)
+
+    resource =
+      %{}
+      |> maybe_put("highlight.project_id", config.project_id)
+      |> maybe_put("service.name", config.service_name)
+      |> maybe_put("service.version", config.service_version)
+      |> Map.put("telemetry.sdk.language", "erlang")
+      |> Map.put("telemetry.sdk.name", "opentelemetry")
+      |> Map.put("telemetry.sdk.version", otel_sdk_version())
+
+    existing_resource =
+      case Application.get_env(:opentelemetry, :resource, %{}) do
+        m when is_map(m) -> m
+        l when is_list(l) -> Map.new(l)
+      end
+
+    Application.put_env(
+      :opentelemetry,
+      :resource,
+      Map.merge(existing_resource, resource)
     )
   end
 
-  def handle_logger_event(_event_name, measurements, metadata, _config) do
-    message = metadata[:message] || "No message"
-
-    Tracer.with_span "highlight.log" do
-      Tracer.add_event(message, measurements)
+  defp otel_sdk_version do
+    case Application.spec(:opentelemetry, :vsn) do
+      nil -> "unknown"
+      vsn -> List.to_string(vsn)
     end
+  end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp attach_log_handler do
+    case Application.ensure_all_started(:opentelemetry_experimental) do
+      {:ok, _} ->
+        # re-init refreshes the handler config (e.g. a changed endpoint)
+        _ = :logger.remove_handler(@log_handler_id)
+
+        :logger.add_handler(@log_handler_id, :otel_log_handler, %{
+          level: :info,
+          exporter: {:opentelemetry_exporter, %{protocol: :http_protobuf}}
+        })
+
+      {:error, reason} ->
+        Logger.warning(
+          "highlight: opentelemetry_experimental unavailable, " <>
+            "console logs will not be exported as LogRecords: #{inspect(reason)}"
+        )
+
+        :ok
+    end
+  end
+
+  defp maybe_instrument_phoenix(%Config{instrument_phoenix: false}), do: :ok
+
+  defp maybe_instrument_phoenix(%Config{instrument_phoenix: true}) do
+    if Code.ensure_loaded?(OpentelemetryPhoenix) do
+      adapter = if Code.ensure_loaded?(OpentelemetryBandit), do: :bandit, else: :cowboy2
+      OpentelemetryPhoenix.setup(adapter: adapter, liveview: true)
+
+      cond do
+        Code.ensure_loaded?(OpentelemetryBandit) -> OpentelemetryBandit.setup()
+        Code.ensure_loaded?(:opentelemetry_cowboy) -> :opentelemetry_cowboy.setup()
+        true -> :ok
+      end
+    end
+
+    :ok
   end
 
   @doc """
-  Records an exception and captures relevant contextual information.
+  Records an exception on a `highlight-ctx` span, following the
+  OpenTelemetry exception reporting semantic convention.
 
-  This function integrates with OpenTelemetry to report exceptions according to the OpenTelemetry exception reporting specification.
-  It allows you to manually record exceptions in your application, attaching additional context like session and request IDs if available.
-  This is useful for tracking errors across distributed systems and associating them with specific user sessions or requests.
+  `config` may be omitted to reuse the config stored by `init/1`.
+  `session_id` and `request_id` carry the Highlight context (normally
+  extracted from the `X-Highlight-Request` header). `stacktrace` should be
+  the original `__STACKTRACE__`; when omitted the current process stacktrace
+  is used.
 
-  ## Parameters
-
-    - `e`: The exception to be recorded. This can be an exception struct, an error tuple, or any Elixir term that represents an error.
-    - `config`: A `%Highlight.Config{}` struct containing the configuration for the Highlight SDK. This includes the project ID, and optionally, the service name and service version.
-    - `session_id` (optional): A string representing the session ID associated with this exception, which can be used to trace the error back to a specific user session. Defaults to `nil`.
-    - `request_id` (optional): A string representing the request ID associated with this exception, which can be used to trace the error back to a specific HTTP request. Defaults to `nil`.
+  Returns `:ok`.
 
   ## Examples
 
-    ```elixir
-    try do
-      # some code that may raise an error
-    rescue
-      exception ->
-        Highlight.record_exception(exception, %Highlight.Config{
-          project_id: "your_project_id",
-          service_name: "your_service_name",
-          service_version: "1.0.0"
-        }, "session_12345", "request_67890")
-    end
-    ```
+      try do
+        risky()
+      rescue
+        e -> Highlight.record_exception(e)
+      end
+
+      Highlight.record_exception(exception, config, "session_id", "request_id")
   """
-  def record_exception(e, config, session_id \\ nil, request_id \\ nil) do
-    Tracer.with_span "highlight-ctx", base_attributes(config) do
-      if session_id do
-        Tracer.set_attributes([{:"highlight.session_id", session_id}])
-      end
+  @spec record_exception(
+          term(),
+          Config.t() | nil,
+          String.t() | nil,
+          String.t() | nil,
+          Exception.stacktrace() | nil
+        ) :: :ok
+  def record_exception(
+        exception,
+        config \\ nil,
+        session_id \\ nil,
+        request_id \\ nil,
+        stacktrace \\ nil
+      ) do
+    config = config || current_config() || %Config{project_id: nil}
+    exception = normalize_exception(exception, stacktrace)
 
-      if request_id do
-        Tracer.set_attributes([{:"highlight.trace_id", request_id}])
-      end
+    attributes =
+      span_attributes(config, session_id, request_id)
 
-      Tracer.record_exception(e, [])
+    Tracer.with_span "highlight-ctx", %{attributes: attributes} do
+      span_ctx = Tracer.current_span_ctx()
+      Tracer.set_status(:error, Exception.message(exception))
+      Span.record_exception(span_ctx, exception, stacktrace, [])
     end
+
+    :ok
   end
 
-  defp base_attributes(config) do
-    [
-      {:"highlight.project_id", config.project_id},
-      {:"telemetry.sdk.language", "erlang"},
-      {:"telemetry.sdk.name", "opentelemetry"},
-      {:"telemetry.sdk.version", "1.4.0"}
-    ] ++
-      if config.service_name do
-        [{:"service.name", config.service_name}]
-      else
-        []
-      end ++
-      if config.service_version do
-        [{:"service.version", config.service_version}]
-      else
-        []
-      end
+  @doc false
+  def span_attributes(%Config{} = config, session_id, request_id) do
+    []
+    |> maybe_put_attr(:"highlight.project_id", config.project_id)
+    |> maybe_put_attr(:"highlight.session_id", session_id)
+    |> maybe_put_attr(:"highlight.trace_id", request_id)
   end
+
+  defp maybe_put_attr(attrs, _key, nil), do: attrs
+  defp maybe_put_attr(attrs, key, value), do: [{key, value} | attrs]
+
+  defp normalize_exception(%{__exception__: true} = exception, _stacktrace), do: exception
+
+  defp normalize_exception(exception, stacktrace),
+    do: Exception.normalize(:error, exception, stacktrace || [])
 end
